@@ -180,6 +180,120 @@ fn spawn_server_paged(model_id: &str, port: u16) -> std::process::Child {
         .expect("failed to spawn inferrs with paged attention")
 }
 
+/// Verifies that `gemma3:4b` (Ollama GGUF) returns a coherent response.
+///
+/// This exercises the llama.cpp→HF tensor rename path for Gemma 3 and the
+/// `gemma_norm_fix` that compensates for the +1.0 RMSNorm weight offset.
+///
+/// Run with:
+/// ```
+/// cargo test --test server_integration gemma3_4b_ollama_returns_intelligible_output -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires Ollama model and significant compute; run with --ignored"]
+fn gemma3_4b_ollama_returns_intelligible_output() {
+    let model_id = "gemma3:4b";
+    let port = free_port();
+
+    let mut server = spawn_server(model_id, port);
+
+    let result = std::panic::catch_unwind(|| {
+        wait_for_health(port, Duration::from_secs(120));
+
+        let resp = chat_completion(port, "What is 2 + 2?");
+
+        // A correct numeric answer ("2 + 2 = 4") has no alphabetic chars, so accept
+        // either a wordy intelligible reply OR a response that contains the digit '4'.
+        assert!(
+            resp.contains('4') || looks_intelligible(&resp),
+            "gemma3:4b response is not intelligible and does not contain '4'.\nGot: {:?}",
+            resp
+        );
+        eprintln!("gemma3:4b response: {:?}", resp);
+    });
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+/// Verifies that `qwen3:latest` (Ollama GGUF) returns a coherent response.
+///
+/// Exercises the Qwen3 llama.cpp rename table.
+///
+/// Run with:
+/// ```
+/// cargo test --test server_integration qwen3_latest_ollama_returns_intelligible_output -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires Ollama model and significant compute; run with --ignored"]
+fn qwen3_latest_ollama_returns_intelligible_output() {
+    let model_id = "qwen3:latest";
+    let port = free_port();
+
+    let mut server = spawn_server(model_id, port);
+
+    let result = std::panic::catch_unwind(|| {
+        wait_for_health(port, Duration::from_secs(120));
+
+        let resp = chat_completion(port, "What is 2 + 2?");
+
+        assert!(
+            resp.contains('4') || looks_intelligible(&resp),
+            "qwen3:latest response is not intelligible and does not contain '4'.\nGot: {:?}",
+            resp
+        );
+        eprintln!("qwen3:latest response: {:?}", resp);
+    });
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+/// Verifies that `qwen3.5:4b` (Ollama GGUF) returns a coherent response.
+///
+/// Exercises the Qwen3.5 llama.cpp rename table and the LinearAttn/SSM layers.
+///
+/// Run with:
+/// ```
+/// cargo test --test server_integration qwen35_4b_ollama_returns_intelligible_output -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires Ollama model and significant compute; run with --ignored"]
+fn qwen35_4b_ollama_returns_intelligible_output() {
+    let model_id = "qwen3.5:4b";
+    let port = free_port();
+
+    let mut server = spawn_server(model_id, port);
+
+    let result = std::panic::catch_unwind(|| {
+        wait_for_health(port, Duration::from_secs(120));
+
+        let resp = chat_completion(port, "What is 2 + 2?");
+
+        assert!(
+            resp.contains('4') || looks_intelligible(&resp),
+            "qwen3.5:4b response is not intelligible and does not contain '4'.\nGot: {:?}",
+            resp
+        );
+        eprintln!("qwen3.5:4b response: {:?}", resp);
+    });
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
 /// Verifies that `google/gemma-4-E2B-it` returns a coherent (intelligible)
 /// response to a trivial chat message.
 ///
@@ -243,14 +357,8 @@ fn gemma4_e2b_returns_intelligible_output() {
             "model returned an empty response for 'What is 2 + 2?'"
         );
 
-        assert!(
-            looks_intelligible(content),
-            "model output does not look intelligible (no ASCII alphabetic chars).\
-             \nGot: {:?}",
-            content
-        );
-
         // For "2 + 2 = 4", the answer should contain "4" somewhere.
+        // Accept a numeric-only reply (e.g. "$2 + 2 = 4$") as intelligible.
         assert!(
             content.contains('4'),
             "expected the answer '4' to appear in the response to 'What is 2 + 2?'.\

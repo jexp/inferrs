@@ -35,6 +35,17 @@ pub fn cache_root() -> PathBuf {
     }
 }
 
+/// Cache root for inferrs-specific data (Ollama metadata, etc.).
+/// Separate from the HuggingFace hub cache so `inferrs list` stays clean.
+/// Resolves to `$XDG_CACHE_HOME/inferrs` or `~/.cache/inferrs`.
+pub fn inferrs_cache_root() -> PathBuf {
+    if let Ok(xdg_cache) = std::env::var("XDG_CACHE_HOME") {
+        PathBuf::from(xdg_cache).join("inferrs")
+    } else {
+        home_dir().join(".cache").join("inferrs")
+    }
+}
+
 /// Portable home directory without pulling in the `dirs` crate.
 ///
 /// Checks `HOME` (Unix) then `USERPROFILE` (Windows), falling back to `/`.

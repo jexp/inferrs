@@ -6,6 +6,7 @@
 pub mod attention_utils;
 pub mod audio_encoder;
 pub mod gemma4;
+pub(crate) mod gguf;
 pub mod quantized_linear;
 pub mod qwen3;
 pub mod qwen3_5;
@@ -19,6 +20,19 @@ use std::path::Path;
 use crate::config::{ModelArchitecture, RawConfig, VisionConfig};
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use quantized_linear::QGgufVarBuilder;
+use gguf::{GgufNaming, var_builder_from_gguf};
+
+/// Returns the HF→llama.cpp tensor rename function for architectures that
+/// support loading from Ollama/llama.cpp GGUFs, or `None` if unsupported.
+fn llama_cpp_rename(arch: &ModelArchitecture) -> Option<fn(&str) -> String> {
+    match arch {
+        ModelArchitecture::Gemma3 => Some(gguf::gemma3_hf_to_llama),
+        ModelArchitecture::Gemma4 => Some(gguf::gemma4_hf_to_llama),
+        ModelArchitecture::Qwen3  => Some(gguf::qwen3_hf_to_llama),
+        ModelArchitecture::Qwen35 => Some(gguf::qwen35_hf_to_llama),
+        _                         => None,
+    }
+}
 
 /// Unified model interface for the engine.
 pub trait CausalLM: Send {
@@ -357,123 +371,6 @@ impl CausalLM for Qwen35ModelWrapper {
     }
 }
 
-/// A lazy [`candle_nn::var_builder::SimpleBackend`] backed by a GGUF file.
-///
-/// Tensors are dequantized on demand — only when the model calls
-/// `VarBuilder::get` for that specific weight.  This avoids the huge memory
-/// spike and slow startup of the previous eager approach (loading all 2 000+
-/// tensors including multi-gigabyte embedding tables upfront).
-///
-/// The GGUF file is kept open for the lifetime of the backend; a `Mutex`
-/// around the `BufReader` satisfies the `Sync` requirement of `SimpleBackend`.
-struct GgufBackend {
-    content: candle_core::quantized::gguf_file::Content,
-    reader: std::sync::Mutex<std::io::BufReader<std::fs::File>>,
-    device: Device,
-}
-
-impl candle_nn::var_builder::SimpleBackend for GgufBackend {
-    fn get(
-        &self,
-        s: candle_core::Shape,
-        name: &str,
-        _: candle_nn::Init,
-        dtype: DType,
-        dev: &Device,
-    ) -> candle_core::Result<Tensor> {
-        let mut reader = self.reader.lock().expect("gguf reader lock poisoned");
-        // Use `dev` (the VarBuilder's device) for loading the quantized tensor
-        // so that if the caller requests CPU placement (e.g. for the enormous
-        // embed_tokens_per_layer table) the data never touches GPU memory.
-        let load_dev = if matches!(dev, Device::Cpu) {
-            dev
-        } else {
-            &self.device
-        };
-        let qt = self
-            .content
-            .tensor(&mut *reader, name, load_dev)
-            .map_err(|e| {
-                candle_core::Error::CannotFindTensor {
-                    path: format!("{name}: {e}"),
-                }
-                .bt()
-            })?;
-
-        let tensor = qt.dequantize(dev)?.to_dtype(dtype)?;
-
-        // Validate shape — same contract as VarBuilder::from_tensors.
-        if tensor.shape() != &s {
-            candle_core::bail!(
-                "shape mismatch for {name}: expected {s:?}, got {:?}",
-                tensor.shape()
-            );
-        }
-        Ok(tensor)
-    }
-
-    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
-        let mut reader = self.reader.lock().expect("gguf reader lock poisoned");
-        let load_dev = if matches!(dev, Device::Cpu) {
-            dev
-        } else {
-            &self.device
-        };
-        let qt = self
-            .content
-            .tensor(&mut *reader, name, load_dev)
-            .map_err(|e| {
-                candle_core::Error::CannotFindTensor {
-                    path: format!("{name}: {e}"),
-                }
-                .bt()
-            })?;
-        qt.dequantize(dev)?.to_dtype(dtype)
-    }
-
-    fn contains_tensor(&self, name: &str) -> bool {
-        self.content.tensor_infos.contains_key(name)
-    }
-}
-
-/// Build a [`VarBuilder`] backed by a GGUF file.
-///
-/// Tensors are dequantized lazily — only on first access — so startup is
-/// fast and peak memory is bounded by the model's actual weight usage rather
-/// than the full file size.
-fn var_builder_from_gguf(
-    gguf_path: &Path,
-    dtype: DType,
-    device: &Device,
-) -> Result<VarBuilder<'static>> {
-    use candle_core::quantized::gguf_file;
-
-    let file = std::fs::File::open(gguf_path)
-        .with_context(|| format!("Cannot open GGUF {}", gguf_path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-
-    let content = gguf_file::Content::read(&mut reader)
-        .with_context(|| format!("Failed to parse GGUF header in {}", gguf_path.display()))?;
-
-    tracing::info!(
-        "Opened GGUF with {} tensors: {}",
-        content.tensor_infos.len(),
-        gguf_path.display()
-    );
-
-    let backend = GgufBackend {
-        content,
-        reader: std::sync::Mutex::new(reader),
-        device: device.clone(),
-    };
-
-    Ok(VarBuilder::from_backend(
-        Box::new(backend),
-        dtype,
-        device.clone(),
-    ))
-}
-
 /// Load a model from weight files.
 #[allow(clippy::too_many_arguments)]
 pub fn load_model(
@@ -489,14 +386,26 @@ pub fn load_model(
     tracing::info!("Loading model weights ({:?} architecture)...", arch);
 
     // When a GGUF is present, load weights from it (dequantizing each tensor
-    // to `dtype`).  Otherwise fall back to the standard mmap'd safetensors path.
-    let vb: VarBuilder<'static> = if let Some(gguf) = gguf_path {
-        var_builder_from_gguf(gguf, dtype, device)?
+    // to `dtype`).  For llama.cpp-named GGUFs (Ollama blobs), wrap the backend
+    // in a RenamingBackend that maps HF tensor names → llama.cpp names on
+    // every `VarBuilder::get` call, so model code needs no changes.
+    let gemma_norm_fix = matches!(arch, ModelArchitecture::Gemma3);
+    let (vb, gguf_naming): (VarBuilder<'static>, Option<GgufNaming>) = if let Some(gguf) = gguf_path {
+        let (vb, naming) = var_builder_from_gguf(gguf, dtype, device, llama_cpp_rename(arch), gemma_norm_fix)?;
+        if naming == GgufNaming::LlamaCpp && llama_cpp_rename(arch).is_none() {
+            tracing::warn!(
+                "GGUF uses llama.cpp tensor naming but {:?} has no rename mapping. \
+                 Tensor lookups will fail.",
+                arch
+            );
+        }
+        (vb, Some(naming))
     } else {
         let paths_ref: Vec<&Path> = weight_paths.iter().map(|p| p.as_ref()).collect();
         // SAFETY: the mmap lifetime is extended to 'static by the unsafe block.
         // The VarBuilder (and the model built from it) keep the mmap alive.
-        unsafe { VarBuilder::from_mmaped_safetensors(&paths_ref, dtype, device)? }
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths_ref, dtype, device)? };
+        (vb, None)
     };
 
     // For Gemma4 loaded from GGUF, also build a QGgufVarBuilder that keeps
@@ -511,7 +420,12 @@ pub fn load_model(
         ModelArchitecture::Gemma4 | ModelArchitecture::Qwen35
     ) {
         gguf_path.and_then(|p| {
-            match QGgufVarBuilder::from_gguf(p, device) {
+            let rename = if gguf_naming == Some(GgufNaming::LlamaCpp) {
+                llama_cpp_rename(arch)
+            } else {
+                None
+            };
+            match QGgufVarBuilder::from_gguf(p, device, rename) {
                 Ok(qvb) => {
                     tracing::info!(
                         "{arch:?}: using quantized weight projection (QMatMul) for GGUF model"
@@ -624,29 +538,39 @@ pub fn load_model(
             let inner = gemma4::Gemma4Model::new(&config, vb.clone(), qvb.as_ref(), gguf_path)?;
 
             // Load audio encoder if audio_config is present in the model config.
+            // Skip for llama.cpp-named GGUFs (Ollama blobs are text-only).
             let audio_encoder = if let Some(audio_cfg) = &raw_config.audio_config {
-                tracing::info!(
-                    "Gemma4 audio encoder: {} layers, hidden={}, output_dims={}",
-                    audio_cfg.num_hidden_layers,
-                    audio_cfg.hidden_size,
-                    audio_cfg.output_proj_dims,
-                );
-                let enc = audio_encoder::AudioEncoder::load(
-                    vb.pp("model"),
-                    audio_cfg,
-                    config.hidden_size,
-                    device,
-                    dtype,
-                )
-                .context("Failed to load Gemma4 audio encoder")?;
-                tracing::info!("Audio encoder loaded successfully");
-                Some(enc)
+                if gguf_naming == Some(GgufNaming::LlamaCpp) {
+                    tracing::info!("Gemma4: skipping audio encoder — llama.cpp GGUF has no audio tower");
+                    None
+                } else {
+                    tracing::info!(
+                        "Gemma4 audio encoder: {} layers, hidden={}, output_dims={}",
+                        audio_cfg.num_hidden_layers,
+                        audio_cfg.hidden_size,
+                        audio_cfg.output_proj_dims,
+                    );
+                    let enc = audio_encoder::AudioEncoder::load(
+                        vb.pp("model"),
+                        audio_cfg,
+                        config.hidden_size,
+                        device,
+                        dtype,
+                    )
+                    .context("Failed to load Gemma4 audio encoder")?;
+                    tracing::info!("Audio encoder loaded successfully");
+                    Some(enc)
+                }
             } else {
                 None
             };
 
             // Load vision encoder if vision_config is present in the model config.
-            let vision_encoder = if let Some(vision_cfg) = &raw_config.vision_config {
+            // Skip for llama.cpp-named GGUFs (Ollama blobs are text-only).
+            let vision_encoder = if gguf_naming == Some(GgufNaming::LlamaCpp) {
+                tracing::info!("Gemma4: skipping vision encoder — llama.cpp GGUF has no vision tower");
+                None
+            } else if let Some(vision_cfg) = &raw_config.vision_config {
                 match vision_cfg {
                     VisionConfig::Gemma4(cfg) => {
                         tracing::info!(

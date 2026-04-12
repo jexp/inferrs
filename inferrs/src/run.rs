@@ -32,8 +32,8 @@ const DEFAULT_PORT: u16 = 17434;
 
 #[derive(Parser, Clone)]
 pub struct RunArgs {
-    /// HuggingFace model ID (e.g. Qwen/Qwen3-0.6B).
-    /// Passed to `inferrs serve` when auto-starting the daemon.
+    /// HuggingFace model ID (e.g. Qwen/Qwen3-0.6B) or Ollama name:tag
+    /// (e.g. gemma4:e4b — must be pulled via `ollama pull` first).
     pub model: String,
 
     /// Optional prompt — when given, run non-interactively and exit

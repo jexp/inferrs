@@ -196,6 +196,8 @@ pub struct QGgufVarBuilder {
     >,
     device: Device,
     path: Vec<String>,
+    /// Optional HF→llama.cpp tensor name mapping (for Ollama GGUFs).
+    rename: Option<fn(&str) -> String>,
 }
 
 impl QGgufVarBuilder {
@@ -204,6 +206,7 @@ impl QGgufVarBuilder {
     pub fn from_gguf<P: AsRef<std::path::Path>>(
         p: P,
         device: &Device,
+        rename: Option<fn(&str) -> String>,
     ) -> candle_core::Result<Self> {
         use candle_core::quantized::gguf_file;
         let mut file = std::fs::File::open(p.as_ref()).map_err(candle_core::Error::from)?;
@@ -214,6 +217,7 @@ impl QGgufVarBuilder {
             cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             device: device.clone(),
             path: Vec::new(),
+            rename,
         })
     }
 
@@ -227,15 +231,21 @@ impl QGgufVarBuilder {
             cache: self.cache.clone(),
             device: self.device.clone(),
             path,
+            rename: self.rename,
         }
     }
 
-    /// Build the fully-qualified name for a tensor under the current namespace.
+    /// Build the fully-qualified name for a tensor under the current namespace,
+    /// applying the rename function when one is set (e.g. HF name → llama.cpp name).
     pub fn full_name(&self, name: &str) -> String {
-        if self.path.is_empty() {
+        let hf_name = if self.path.is_empty() {
             name.to_string()
         } else {
             format!("{}.{}", self.path.join("."), name)
+        };
+        match self.rename {
+            Some(f) => f(&hf_name),
+            None => hf_name,
         }
     }
 

@@ -49,12 +49,22 @@ scoop install inferrs
 inferrs run google/gemma-4-E2B-it
 ```
 
+#### Run an Ollama model
+
+```bash
+inferrs run gemma4:e4b
+```
+
+Uses the GGUF blob already pulled by `ollama pull`. Config and tokenizer
+are fetched from HuggingFace once and cached in `~/.cache/inferrs/ollama/`.
+
 ### Serve
 
 #### Serve a specific model (OpenAI/Anthropic/Ollama API on port 8080)
 
 ```bash
 inferrs serve google/gemma-4-E2B-it
+inferrs serve gemma4:e4b
 ```
 
 #### Serve a specific model vLLM-style

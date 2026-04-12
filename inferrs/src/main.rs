@@ -5,10 +5,12 @@ mod config;
 mod engine;
 mod grammar;
 mod hub;
+mod hub_ollama;
 mod kv_cache;
 mod list;
 mod models;
 mod nvfp4;
+mod ollama;
 mod pull;
 mod quantize;
 mod rm;
@@ -63,9 +65,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Serve a model from HuggingFace Hub
+    /// Serve a model from HuggingFace Hub or Ollama (name:tag)
     Serve(ServeArgs),
-    /// Run a model interactively
+    /// Run a model interactively from HuggingFace Hub or Ollama (name:tag)
     Run(run::RunArgs),
     /// Benchmark inference throughput and latency
     Bench(bench::BenchArgs),
@@ -82,7 +84,11 @@ enum Commands {
 
 #[derive(Parser, Clone)]
 pub struct ServeArgs {
-    /// HuggingFace model ID (e.g. Qwen/Qwen3.5-0.8B).
+    /// Model to serve. Accepts:
+    ///   - HuggingFace ID:   google/gemma-3-1b-it
+    ///   - Ollama name:tag:  gemma4:e4b  (must be already pulled via `ollama pull`)
+    ///   - Local directory:  ./my-model  (must contain config.json + tokenizer.json)
+    ///
     /// When omitted, inferrs starts without loading a model and exposes the
     /// Ollama-compatible API on port 17434 (same behaviour as `ollama serve`).
     pub model: Option<String>,
@@ -173,6 +179,14 @@ pub struct ServeArgs {
     /// then the first .gguf file found).
     #[arg(long, value_name = "FILENAME")]
     pub gguf_file: Option<String>,
+
+    /// Load weights from an existing local GGUF file instead of downloading
+    /// safetensors.  The model argument still supplies `config.json` and
+    /// `tokenizer.json` but no weight shards are fetched.
+    ///
+    /// Incompatible with `--quantize`.
+    #[arg(long, value_name = "PATH")]
+    pub gguf: Option<std::path::PathBuf>,
 
     /// Quantize model weights and cache the result on disk as a GGUF file.
     /// On first use the weights are quantized and saved next to the HuggingFace cache;

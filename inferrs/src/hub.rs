@@ -14,11 +14,12 @@ pub struct ModelFiles {
     pub config_path: PathBuf,
     pub tokenizer_path: PathBuf,
     pub tokenizer_config_path: Option<PathBuf>,
-    /// Original safetensors shards (always present).
+    /// Safetensors weight shards.  Empty when loading from a GGUF (`--gguf`,
+    /// `--quantize`, Ollama, or GGUF-only HF repos).
     pub weight_paths: Vec<PathBuf>,
-    /// Path to the quantized GGUF file, populated when `--quantize` was given.
-    /// When `Some`, callers should load weights from this GGUF instead of
-    /// `weight_paths`.
+    /// GGUF weight file.  Populated by `--quantize`, `--gguf`, Ollama models,
+    /// and GGUF-only HF repos.  When `Some`, callers load weights from here
+    /// instead of `weight_paths`.
     pub gguf_path: Option<PathBuf>,
 }
 
@@ -369,3 +370,4 @@ fn download_safetensors(repo: &hf_hub::api::sync::ApiRepo) -> Result<Vec<PathBuf
 
     Ok(paths)
 }
+

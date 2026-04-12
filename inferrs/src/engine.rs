@@ -130,12 +130,36 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         .model
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("No model specified; pass a HuggingFace model ID"))?;
-    let model_files = crate::hub::download_and_maybe_quantize(
-        model_id,
-        &args.revision,
-        args.gguf_file.as_deref(),
-        quant_dtype,
-    )?;
+    let model_files = if let Some(gguf_path) = &args.gguf {
+        // ── Explicit --gguf: use named GGUF, pull only metadata from HF ──
+        anyhow::ensure!(
+            args.quantize.is_none(),
+            "--gguf and --quantize are mutually exclusive"
+        );
+        anyhow::ensure!(
+            gguf_path.exists(),
+            "GGUF file not found: {}",
+            gguf_path.display()
+        );
+        tracing::info!("Using external GGUF: {}", gguf_path.display());
+        let mut files = crate::hub_ollama::load_config_and_tokenizer(model_id, &args.revision)?;
+        files.gguf_path = Some(gguf_path.clone());
+        files
+    } else if crate::ollama::is_ollama_model_id(model_id) {
+        // ── Ollama model (name:tag): locate GGUF + auto-fetch HF metadata ──
+        anyhow::ensure!(
+            args.quantize.is_none(),
+            "--quantize is not supported for Ollama models (they are already quantized)"
+        );
+        crate::ollama::load_model_files(model_id, &args.revision)?
+    } else {
+        crate::hub::download_and_maybe_quantize(
+            model_id,
+            &args.revision,
+            args.gguf_file.as_deref(),
+            quant_dtype,
+        )?
+    };
 
     let raw_config = RawConfig::from_file(&model_files.config_path)?;
     let arch = raw_config.detect_architecture()?;

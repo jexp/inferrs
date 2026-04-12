@@ -384,11 +384,14 @@ struct LinearAttn {
 
 impl LinearAttn {
     fn new(cfg: &Qwen35Config, vb: VarBuilder, qvb: Option<&QGgufVarBuilder>) -> Result<Self> {
-        let n_heads = cfg.linear_num_key_heads;
-        let head_k_dim = cfg.linear_key_head_dim;
+        // The number of independent SSM streams is determined by the *value* head count,
+        // which may differ from the key head count (e.g. 4.7B: n_key=16, n_value=32).
+        let n_heads = cfg.linear_num_value_heads;
         let head_v_dim = cfg.linear_value_head_dim;
-        let key_dim = n_heads * head_k_dim;
+        let key_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
         let value_dim = n_heads * head_v_dim;
+        // Per-SSM-head key dim: key_dim split evenly across n_heads.
+        let head_k_dim = key_dim / n_heads;
         let conv_dim = key_dim * 2 + value_dim;
         let hidden = cfg.hidden_size;
         let kernel = cfg.linear_conv_kernel_dim;
@@ -422,9 +425,14 @@ impl LinearAttn {
             qvb.map(|q| q.pp("in_proj_b")).as_ref(),
         )?;
 
-        // conv1d weight: [conv_dim, 1, kernel] -- depthwise
+        // conv1d weight: [conv_dim, 1, kernel] -- depthwise.
+        // llama.cpp GGUFs store this as 2D [conv_dim, kernel]; reshape to 3D on load.
         let conv1d_weight = vb
-            .get((conv_dim, 1, kernel), "conv1d.weight")?
+            .get((conv_dim, 1, kernel), "conv1d.weight")
+            .or_else(|_| {
+                vb.get((conv_dim, kernel), "conv1d.weight")
+                    .and_then(|w| w.reshape((conv_dim, 1, kernel)).map_err(Into::into))
+            })?
             .to_dtype(DType::F32)?;
 
         // A_log, dt_bias, and norm.weight must be kept in F32 for the SSM recurrence.
